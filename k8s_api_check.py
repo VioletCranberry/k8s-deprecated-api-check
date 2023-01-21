@@ -17,9 +17,9 @@ class K8sApiSpecDiff:
         :param k8s_lesser_ver:  lesser  k8s version (e.g. 1.21)
         :param k8s_greater_ver: greater k8s version (e.g. 1.22)
         """
-        self.k8s_api_spec_old = Utils.load_k8s_git_api_spec(
+        self.k8s_api_spec_old = Utils.load_k8s_api_spec(
             k8s_lesser_ver)
-        self.k8s_api_spec_new = Utils.load_k8s_git_api_spec(
+        self.k8s_api_spec_new = Utils.load_k8s_api_spec(
             k8s_greater_ver)
         self.k8s_api_spec_key = "paths"
 
@@ -58,6 +58,7 @@ class K8sApiSpecDiff:
             exclude_regex_paths=diff_path_excluded,
             ignore_order=True, view="tree"
         )
+        logging.debug(f"generated api spec diff: {spec_diff}")
         return spec_diff
 
 
@@ -93,6 +94,7 @@ class PrettySpecDiff:
         k8s_api_paths = sorted(set(k8s_api_paths))
         logging.info(f"diff key [{diff_key}]: fetched "
                      f"{len(k8s_api_paths)} APIs")
+        logging.debug(f"kubernetes APIs: {k8s_api_paths}")
         return k8s_api_paths
 
     def verify_diff_changes(self):
@@ -137,6 +139,7 @@ class ApisListParser:
                   in self.api_named_group
                   if (match := re.search(re_group_pattern, api_path))]
         groups = sorted(set(groups))
+        logging.debug(f"filtered kubernetes named API groups: {groups}")
         logging.info(f"kubernetes named API groups: "
                      f"filtered {len(groups)} APIs")
         return groups
@@ -152,6 +155,7 @@ class ApisListParser:
                   in self.api_core_group
                   if (match := re.search(re_group_pattern, api_path))]
         groups = sorted(set(groups))
+        logging.debug(f"filtered kubernetes legacy API groups: {groups}")
         logging.info(f"kubernetes legacy API groups: "
                      f"filtered {len(groups)} APIs")
         return groups
@@ -160,17 +164,22 @@ class ApisListParser:
 # This class provides utilities to track kubernetes APIs in files under directory
 class YamlFileParser:
 
-    def __init__(self, dir_path: str, api_list: list):
+    def __init__(self, dir_path: str, file_extensions: list, api_list: list):
         """
         :param dir_path: directory of files
         :param api_list: list of kubernetes apis to compare against
         """
         self.dir_path = dir_path
+        self.file_extensions = file_extensions
         self.k8s_apis = api_list
+        self.deprecated = False
 
         self.files_pattern = re.compile(r"(?<=apiVersion: ).+")
-        for file in self.get_files_to_track():
-            self.process_file(file)
+        for file_path in self.get_files_to_track():
+            self.process_file(file_path)
+
+        if self.deprecated:
+            sys.exit(1)
 
     def get_files_to_track(self):
         """
@@ -178,7 +187,7 @@ class YamlFileParser:
         :return: list of file paths
         """
         tracked_files = []
-        file_extensions = ("*.yaml", "*.yml", "*.tpl")
+        file_extensions = set(self.file_extensions)
         for ext in file_extensions:
             _path = f"{self.dir_path}/**/{ext}"
             files = glob(_path, recursive=True)
@@ -186,6 +195,7 @@ class YamlFileParser:
             logging.info(f"file extension [{ext}]: "
                          f"tracking {len(files)} files")
         tracked_files.sort()
+        logging.debug(f"files: {tracked_files}")
         return tracked_files
 
     def search_apis_in_file(self, file_path: str):
@@ -209,6 +219,7 @@ class YamlFileParser:
         files_apis = self.search_apis_in_file(file_path)
         for api in files_apis:
             if api in self.k8s_apis:
+                self.deprecated = True
                 logging.warning(f"deprecated api "
                                 f"[{api}] in "
                                 f"file [{file_path}]")
@@ -217,7 +228,7 @@ class YamlFileParser:
 class Utils:
 
     @staticmethod
-    def load_k8s_git_api_spec(version: str):
+    def load_k8s_api_spec(version: str):
         """
         Load kubernetes swagger OpenApi spec from GitHub
         :param version: Kubernetes version (e.g 1.22)
@@ -247,35 +258,40 @@ class Utils:
 
 def get_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-lv', '--lesser_ver',
-                        action='store',
+    parser.add_argument("-lv", "--lesser_ver",
+                        action="store",
                         type=str,
                         required=True,
-                        help='lesser k8s versions (e.g. 1.21)')
-    parser.add_argument('-gv', '--greater_ver',
-                        action='store',
+                        help="lesser k8s versions (e.g. 1.21)")
+    parser.add_argument("-gv", "--greater_ver",
+                        action="store",
                         type=str,
                         required=True,
-                        help='greater k8s versions (e.g. 1.22)')
-    parser.add_argument('-pp', '--pretty_print',
-                        action='store_true',
+                        help="greater k8s versions (e.g. 1.22)")
+    parser.add_argument("-ext", "--file_extensions",
+                        nargs="+",
+                        help="list of file extensions to parse",
+                        required=False)
+    parser.add_argument("-pp", "--pretty_print",
+                        action="store_true",
                         required=False,
-                        help='print deprecated k8s API groups')
-    parser.add_argument('-yp', '--yaml_path',
-                        action='store',
+                        help="print deprecated k8s API groups")
+    parser.add_argument("-yp", "--yaml_path",
+                        action="store",
                         type=str,
                         required=False,
-                        help='path to directory to look for '
-                             'deprecated APIs')
-    parser.add_argument('-d', '--debug',
-                        action='store_true',
+                        help="path to directory to look for "
+                             "deprecated APIs")
+    parser.add_argument("-d", "--debug",
+                        action="store_true",
                         required=False)
     return parser.parse_args()
 
 
 def main():
     args = get_arguments()
-    logging.basicConfig(level=logging.INFO,
+    args.file_extensions = args.file_extensions if args.file_extensions else ["*.yaml", "*.yml", "*.tpl"]
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(asctime)s - "
                                "%(levelname)s - "
                                "%(message)s")
@@ -287,12 +303,11 @@ def main():
     api_list = [*api_list_parser.filter_api_core_groups(),
                 *api_list_parser.filter_api_named_groups()]
 
-    if args.yaml_path:
-        YamlFileParser(args.yaml_path, api_list)
-
     if args.pretty_print:
         print(tabulate({"Api Groups Deprecated": api_list},
                        headers="keys", tablefmt="pretty"))
+    if args.yaml_path:
+        YamlFileParser(args.yaml_path, args.file_extensions, api_list)
 
 
 if __name__ == "__main__":
