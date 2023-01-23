@@ -5,11 +5,69 @@ import sys
 import re
 
 from deepdiff import DeepDiff
-from tabulate import tabulate
+from difflib import SequenceMatcher
 from glob import glob
 
 
-# This class provides a deepDiff wrapper around two k8s API json specs
+def get_arguments():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-lv", "--lesser_ver",
+                        action="store",
+                        type=str,
+                        required=True,
+                        help="lesser k8s versions (e.g. 1.21)")
+    parser.add_argument("-gv", "--greater_ver",
+                        action="store",
+                        type=str,
+                        required=True,
+                        help="greater k8s versions (e.g. 1.22)")
+    parser.add_argument("-ext", "--file_extensions",
+                        nargs="+",
+                        help="list of file extensions to parse",
+                        required=False)
+    parser.add_argument("-yp", "--yaml_path",
+                        action="store",
+                        type=str,
+                        required=False,
+                        help="path to directory to look for "
+                             "deprecated APIs")
+    parser.add_argument("-d", "--debug",
+                        action="store_true",
+                        required=False)
+    return parser.parse_args()
+
+
+class GitUtils:
+
+    @staticmethod
+    def load_k8s_api_spec(version: str):
+        """
+        Load kubernetes swagger OpenApi spec from GitHub
+        :param version: Kubernetes version (e.g 1.22)
+        :return: swagger OpenApi spec json
+        """
+        logging.info(f"fetching api spec for version {version}")
+
+        release_ver = f"release-{version}"
+        swagger_url = f"https://raw.githubusercontent.com/" \
+                      f"kubernetes/kubernetes/{release_ver}" \
+                      f"/api/openapi-spec/swagger.json"
+        try:
+            api_spec = requests.get(swagger_url)
+            api_spec.raise_for_status()
+
+            return api_spec.json()
+        except requests.exceptions.RequestException as err:
+            logging.fatal(f"error while fetching "
+                          f"k8s api spec: {err}")
+            sys.exit(1)
+        except requests.exceptions.JSONDecodeError as err:
+            logging.fatal(f"error while fetching "
+                          f"k8s api spec: {err} - "
+                          f"invalid json")
+            sys.exit(1)
+
+
 class K8sApiSpecDiff:
 
     def __init__(self, k8s_lesser_ver: str, k8s_greater_ver: str):
@@ -17,9 +75,9 @@ class K8sApiSpecDiff:
         :param k8s_lesser_ver:  lesser  k8s version (e.g. 1.21)
         :param k8s_greater_ver: greater k8s version (e.g. 1.22)
         """
-        self.k8s_api_spec_old = Utils.load_k8s_api_spec(
+        self.k8s_api_spec_old = GitUtils.load_k8s_api_spec(
             k8s_lesser_ver)
-        self.k8s_api_spec_new = Utils.load_k8s_api_spec(
+        self.k8s_api_spec_new = GitUtils.load_k8s_api_spec(
             k8s_greater_ver)
         self.k8s_api_spec_key = "paths"
 
@@ -75,9 +133,9 @@ class PrettySpecDiff:
         self.k8s_api_spec_diff = k8s_api_spec_diff
         self.verify_diff_changes()
 
-        self.k8s_api_paths_new = self.fetch_api_paths(
+        self.k8s_api_paths_added = self.fetch_api_paths(
             self.deep_diff_req_key[1])
-        self.k8s_api_paths_old = self.fetch_api_paths(
+        self.k8s_api_paths_removed = self.fetch_api_paths(
             self.deep_diff_req_key[0])
 
     def fetch_api_paths(self, diff_key: str):
@@ -107,58 +165,110 @@ class PrettySpecDiff:
             sys.exit(1)
 
 
-# This class provides utilities for working with kubernetes APIs
-class ApisListParser:
+# This class provides utilities for working with kubernetes named API groups
+class NamedAPIListParser:
 
-    def __init__(self, k8s_api_paths_list: list):
+    def __init__(self, api_path_list: list):
         """
-        :param k8s_api_paths_list: list of kubernetes APIs
+        :param api_path_list: list of kubernetes APIs
         """
-        self.k8s_api_paths_list = k8s_api_paths_list
+        self.api_path_list = api_path_list
+        self.api_list = [api_path for api_path in self.api_path_list
+                         if api_path.startswith("/apis")]
 
-        self.api_core_group = [api_path for api_path
-                               in self.k8s_api_paths_list
-                               if api_path.startswith("/api/v1")]
+        self.api_groups = self.filter_api_groups()
+        self.api_resource_types = self.filter_api_resource_types()
+        self.named_api_data = self.generate_filtered_api_list()
 
-        self.api_named_group = [api_path for api_path
-                                in self.k8s_api_paths_list
-                                if api_path.startswith("/apis")]
+    def filter_api_groups(self):
+        """
+        filter list of api groups in form of /apis/GROUP/VERSION
+        """
+        re_pattern = r"(?<=/apis/).+/.+\d"  # /apis/GROUP/VERSION
+        api_groups = [match.group() for api_path
+                      in self.api_list
+                      if (match := re.search(re_pattern, api_path))]
+        api_groups = sorted(set(api_groups))
+        logging.debug(f"named api groups: {api_groups}")
+        logging.info(f"total kubernetes named API groups: "
+                     f"{len(api_groups)} APIs")
+        return api_groups
 
-    def filter_api_named_groups(self):
+    def filter_api_resource_types(self):
         """
-        parse kubernetes named API groups by group name and version
-        :return: sorted group names without duplicates
+        filter list of api group resource types in form of /apis/GROUP/VERSION/RESOURCETYPE
         """
-        # match API paths of (/apis) group_name version
-        # r"(?<=/apis/).+/.+\d$" is also a valid pattern
-        # however not an entire group is usually removed
-        # so we give user a hint that group is removed,
-        # and it's better to migrate
-        re_group_pattern = r"(?<=/apis/).+/.+\d"
-        groups = [match.group() for api_path
-                  in self.api_named_group
-                  if (match := re.search(re_group_pattern, api_path))]
-        groups = sorted(set(groups))
-        logging.debug(f"filtered kubernetes named API groups: {groups}")
-        logging.info(f"kubernetes named API groups: "
-                     f"filtered {len(groups)} APIs")
+        excluded_patterns = ["namespace", "name", "watch", "create", "update"]
+        api_resource_types = []
+        for api in self.api_list:
+            for group in self.api_groups:
+                re_pattern = rf"(?<=/apis/){group}/\w+(?!=/)"  # /apis/GROUP/VERSION/RESOURCETYPE
+                match = re.search(re_pattern, api)
+                if match and not any(pattern in match.group()
+                                     for pattern in excluded_patterns):
+                    api_resource_types.append(match.group())
+        api_resource_types = sorted(set(api_resource_types))
+        logging.debug(f"named api resources: {api_resource_types}")
+        logging.info(f"total kubernetes named API resource types: "
+                     f"{len(api_resource_types)} resources")
+        return api_resource_types
+
+    def generate_filtered_api_list(self):
+        """
+        generate list of dictionaries of the following format:
+        [{'api_group': 'admissionregistration.k8s.io/v1beta1',
+         'api_resource_types': ['mutatingwebhookconfigurations',
+                                'validatingwebhookconfigurations']},
+         {'api_group': 'apiextensions.k8s.io/v1beta1',
+         'api_resource_types': ['customresourcedefinitions']}...]
+        """
+        filtered_list = []
+        for api_group in self.api_groups:
+            api_resource_types = [api_resource.split("/")[-1] for api_resource
+                                  in self.api_resource_types
+                                  if api_group in api_resource]
+            filtered_list.append({"api_group": api_group,
+                                  "api_resource_types": api_resource_types
+                                  })
+        logging.info(f"api list: {filtered_list}")
+        return filtered_list
+
+
+def search_api_groups_in_file(file_path: str):
+    """
+    locate all API groups in file
+    :param file_path: path to file
+    :return: all k8s api groups in file
+    """
+    re_pattern = re.compile(r"(?<=apiVersion: ).+")
+    with open(file_path, "r") as tracked_file:
+        groups = [match.group().strip("'").strip('"')
+                  for line in tracked_file if
+                  (match := re_pattern.search(line))]
         return groups
 
-    def filter_api_core_groups(self):
-        """
-        parse kubernetes legacy API groups by group name and version
-        :return: sorted group names without duplicates
-        """
-        # match API paths of (/api) version group_name (/)
-        re_group_pattern = r"(?<=/api/).+?/.+?(?=/)"
-        groups = [match.group() for api_path
-                  in self.api_core_group
-                  if (match := re.search(re_group_pattern, api_path))]
-        groups = sorted(set(groups))
-        logging.debug(f"filtered kubernetes legacy API groups: {groups}")
-        logging.info(f"kubernetes legacy API groups: "
-                     f"filtered {len(groups)} APIs")
-        return groups
+
+def search_api_resources_in_file(file_path: str):
+    """
+    locate all API kinds in file
+    :param file_path: path to file
+    :return: all k8s api kinds in file
+    """
+    re_pattern = re.compile(r"(?<=kind: )\w+")
+    with open(file_path, "r") as tracked_file:
+        resources = [match.group().strip("'").strip('"')
+                     for line in tracked_file if
+                     (match := re_pattern.search(line))]
+        return resources
+
+
+def is_strings_similar(str1: str, str2: str, threshold: float = 0.8):
+    """
+    api kind is singular while definition of RESOURCETYPE under
+    /apis/GROUP/VERSION/RESOURCETYPE is plural: check strings equality
+    based on the longest contiguous matching subsequence.
+    """
+    return SequenceMatcher(a=str1, b=str2).ratio() > threshold
 
 
 # This class provides utilities to track kubernetes APIs in files under directory
@@ -174,9 +284,15 @@ class YamlFileParser:
         self.k8s_apis = api_list
         self.deprecated = False
 
-        self.files_pattern = re.compile(r"(?<=apiVersion: ).+")
         for file_path in self.get_files_to_track():
-            self.process_file(file_path)
+            deprecated_apis = self.get_deprecated_api_groups(file_path)
+            if deprecated_apis:
+                self.deprecated = True
+                for api in deprecated_apis:
+                    deprecated_kinds = self.get_deprecated_api_kinds(
+                        file_path, api)
+                    if deprecated_kinds:
+                        self.deprecated = True
 
         if self.deprecated:
             sys.exit(1)
@@ -198,94 +314,37 @@ class YamlFileParser:
         logging.debug(f"files: {tracked_files}")
         return tracked_files
 
-    def search_apis_in_file(self, file_path: str):
+    def get_deprecated_api_groups(self, file_path: str):
         """
-        locate all API resources in file
-        :param file_path: path to file
-        :return: all k8s apis in file
+        get deprecated API groups in file
+        :param: file_path: file path
         """
-        with open(file_path, "r") as tracked_file:
-            apis = [match.group().strip("'").strip('"')
-                    for line in tracked_file if
-                    (match := self.files_pattern.search(line))]
-            return apis
+        api_groups = [api["api_group"] for api in self.k8s_apis]
+        deprecated = []
+        for api in search_api_groups_in_file(file_path):
+            if api in api_groups:
+                logging.debug(f"deprecated api group "
+                              f"[{api}] in file [{file_path}]")
+                deprecated.append(api)
+        return deprecated
 
-    def process_file(self, file_path: str):
+    def get_deprecated_api_kinds(self, file_path: str, resource_group: str):
         """
-        search for all API resources in file and
-        compare them against a list of k8s apis
-        :param file_path: path to file
+        get deprecated API kinds in file based on API group
+        :param: file_path: file path
+        :param: resource_group: api group
         """
-        files_apis = self.search_apis_in_file(file_path)
-        for api in files_apis:
-            if api in self.k8s_apis:
-                self.deprecated = True
-                logging.warning(f"deprecated api "
-                                f"[{api}] in "
-                                f"file [{file_path}]")
-
-
-class Utils:
-
-    @staticmethod
-    def load_k8s_api_spec(version: str):
-        """
-        Load kubernetes swagger OpenApi spec from GitHub
-        :param version: Kubernetes version (e.g 1.22)
-        :return: swagger OpenApi spec json
-        """
-        logging.info(f"fetching api spec for version {version}")
-
-        release_ver = f"release-{version}"
-        swagger_url = f"https://raw.githubusercontent.com/" \
-                      f"kubernetes/kubernetes/{release_ver}" \
-                      f"/api/openapi-spec/swagger.json"
-        try:
-            api_spec = requests.get(swagger_url)
-            api_spec.raise_for_status()
-
-            return api_spec.json()
-        except requests.exceptions.RequestException as err:
-            logging.fatal(f"error while fetching "
-                          f"k8s api spec: {err}")
-            sys.exit(1)
-        except requests.exceptions.JSONDecodeError as err:
-            logging.fatal(f"error while fetching "
-                          f"k8s api spec: {err} - "
-                          f"invalid json")
-            sys.exit(1)
-
-
-def get_arguments():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-lv", "--lesser_ver",
-                        action="store",
-                        type=str,
-                        required=True,
-                        help="lesser k8s versions (e.g. 1.21)")
-    parser.add_argument("-gv", "--greater_ver",
-                        action="store",
-                        type=str,
-                        required=True,
-                        help="greater k8s versions (e.g. 1.22)")
-    parser.add_argument("-ext", "--file_extensions",
-                        nargs="+",
-                        help="list of file extensions to parse",
-                        required=False)
-    parser.add_argument("-pp", "--pretty_print",
-                        action="store_true",
-                        required=False,
-                        help="print deprecated k8s API groups")
-    parser.add_argument("-yp", "--yaml_path",
-                        action="store",
-                        type=str,
-                        required=False,
-                        help="path to directory to look for "
-                             "deprecated APIs")
-    parser.add_argument("-d", "--debug",
-                        action="store_true",
-                        required=False)
-    return parser.parse_args()
+        api_group_data = next((item for item in self.k8s_apis
+                               if item["api_group"] == resource_group), None)
+        deprecated = []
+        for api_kind in search_api_resources_in_file(file_path):
+            for api_resource in api_group_data["api_resource_types"]:
+                if is_strings_similar(api_kind.lower(), api_resource):
+                    logging.warning(f"deprecated api kind [{api_kind}] "
+                                    f"for deprecated api group [{resource_group}] in "
+                                    f"file [{file_path}]")
+                    deprecated.append(api_kind)
+        return deprecated
 
 
 def main():
@@ -293,21 +352,19 @@ def main():
     args.file_extensions = args.file_extensions if args.file_extensions else ["*.yaml", "*.yml", "*.tpl"]
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(asctime)s - "
+                               "%(name)s - "
                                "%(levelname)s - "
                                "%(message)s")
 
     api_spec_diff = K8sApiSpecDiff(args.lesser_ver, args.greater_ver)
     api_spec_diff = PrettySpecDiff(api_spec_diff.k8s_api_spec_diff)
 
-    api_list_parser = ApisListParser(api_spec_diff.k8s_api_paths_old)
-    api_list = [*api_list_parser.filter_api_core_groups(),
-                *api_list_parser.filter_api_named_groups()]
+    api_list_removed = NamedAPIListParser(
+        api_spec_diff.k8s_api_paths_removed)
 
-    if args.pretty_print:
-        print(tabulate({"Api Groups Deprecated": api_list},
-                       headers="keys", tablefmt="pretty"))
     if args.yaml_path:
-        YamlFileParser(args.yaml_path, args.file_extensions, api_list)
+        YamlFileParser(args.yaml_path, args.file_extensions,
+                       api_list_removed.named_api_data)
 
 
 if __name__ == "__main__":
